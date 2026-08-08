@@ -28,11 +28,10 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fenbi_client import FenbiClient
-from data_extractor import transform_records, deduplicate_records, save_to_csv
+from data_extractor import deduplicate_records, sort_records, save_to_csv
 
 
 def setup_logging(debug: bool = False):
-    """配置日志输出到 stdout（GitHub Actions 可见）"""
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
@@ -42,17 +41,11 @@ def setup_logging(debug: bool = False):
 
 
 def load_config() -> dict:
-    """
-    加载配置
-    优先读取环境变量（GitHub Secrets），其次读取 config.ini（本地测试）
-    """
     phone = os.environ.get("FENBI_PHONE", "")
     password = os.environ.get("FENBI_PASSWORD", "")
-
-    request_interval = float(os.environ.get("REQUEST_INTERVAL", "0.5"))
+    request_interval = float(os.environ.get("REQUEST_INTERVAL", "0.25"))
     debug = os.environ.get("DEBUG", "true").lower() == "true"
 
-    # 如果环境变量中没有配置，尝试从 config.ini 读取（本地测试模式）
     if not phone or not password:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, "config.ini")
@@ -64,7 +57,6 @@ def load_config() -> dict:
 
             phone = phone or config.get("FENBI", "phone", fallback="")
             password = password or config.get("FENBI", "password", fallback="")
-
             request_interval = config.getfloat("AUTOMATION", "request_interval", fallback=request_interval)
             debug = config.getboolean("AUTOMATION", "debug", fallback=debug)
 
@@ -77,7 +69,6 @@ def load_config() -> dict:
 
 
 def main():
-    """主入口函数"""
     setup_logging()
     logger = logging.getLogger("main")
 
@@ -86,21 +77,17 @@ def main():
     logger.info("时间: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("=" * 60)
 
-    # 加载配置
     cfg = load_config()
 
-    # 验证粉笔账号
     if not cfg["phone"] or not cfg["password"]:
         logger.error("未配置粉笔账号密码")
         logger.error("云端运行: 请在 GitHub Secrets 中设置 FENBI_PHONE 和 FENBI_PASSWORD")
         logger.error("本地运行: 请在 config.ini 中填写账号密码")
         return False
 
-    logger.info("配置验证通过")
-    logger.info("  粉笔账号: %s", cfg["phone"])
+    logger.info("配置验证通过 (账号: %s)", cfg["phone"])
 
     try:
-        # 1. 登录粉笔并采集数据
         client = FenbiClient(
             phone=cfg["phone"],
             password=cfg["password"],
@@ -108,7 +95,7 @@ def main():
         )
 
         if not client.login():
-            logger.error("粉笔登录失败，请检查账号密码是否正确")
+            logger.error("粉笔登录失败")
             return False
 
         logger.info("开始采集全部练习数据...")
@@ -116,34 +103,41 @@ def main():
 
         if not raw_records:
             logger.warning("未获取到任何练习记录")
-            logger.info("可能原因: 1)账号没有练习历史 2)API结构变化 3)网络问题")
             return False
 
         logger.info("共获取原始记录 %d 条", len(raw_records))
 
-        # 2. 转换数据格式
-        transformed = transform_records(raw_records)
-        transformed = deduplicate_records(transformed)
-        logger.info("数据转换 + 去重完成: %d 条", len(transformed))
+        # 去重 + 排序
+        records = deduplicate_records(raw_records)
+        records = sort_records(records)
+        logger.info("去重 + 排序完成: %d 条", len(records))
 
-        if not transformed:
-            logger.warning("转换后无有效数据")
+        if not records:
+            logger.warning("处理后无有效数据")
             return False
 
-        # 3. 保存为 CSV 文件
+        # 统计
+        correct = sum(1 for r in records if r.get("是否正确") == "正确")
+        wrong = sum(1 for r in records if r.get("是否正确") == "错误")
+        unanswered = sum(1 for r in records if r.get("是否正确") == "未答")
+        total = correct + wrong + unanswered
+        rate = correct / total * 100 if total > 0 else 0
+        logger.info("统计: 正确 %d, 错误 %d, 未答 %d, 正确率 %.1f%%", correct, wrong, unanswered, rate)
+
+        # 保存 CSV
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "practice_history.csv")
-        save_to_csv(transformed, csv_path)
+        save_to_csv(records, csv_path)
 
         logger.info("=" * 60)
         logger.info("粉笔练习数据采集 → CSV - 完成")
-        logger.info("记录数: %d 条", len(transformed))
-        logger.info("CSV 路径: %s", csv_path)
+        logger.info("记录数: %d 条", len(records))
+        logger.info("CSV: %s", csv_path)
         logger.info("时间: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         logger.info("=" * 60)
         return True
 
     except Exception as e:
-        logger.error("运行过程中发生错误: %s", e, exc_info=True)
+        logger.error("运行错误: %s", e, exc_info=True)
         return False
 
 
