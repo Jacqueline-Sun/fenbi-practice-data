@@ -1,0 +1,44 @@
+name: Fenbi Daily Sync
+
+on:
+  schedule:
+    # UTC 22:00 = 北京时间 06:00
+    # GitHub Actions 使用 UTC 时间，可能有 5-30 分钟延迟
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    # 支持在 GitHub Actions 页面手动触发
+
+permissions:
+  contents: write
+  # 需要写权限以提交 CSV 数据文件
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Fenbi data sync
+        env:
+          FENBI_PHONE: ${{ secrets.FENBI_PHONE }}
+          FENBI_PASSWORD: ${{ secrets.FENBI_PASSWORD }}
+        run: python main.py
+
+      - name: Commit CSV data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/practice_history.csv || true
+          git diff --staged --quiet || git commit -m "data: update practice history [skip ci]"
+          git push || echo "No changes to push"
