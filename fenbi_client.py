@@ -1,43 +1,40 @@
 """
-粉笔 API 客户端
-负责登录认证、获取练习历史、题目元数据等
+粉笔 API 客户端 (v2)
+使用 /combine/exercise/ 系列端点，获取三级模块、单题用时等完整数据
 
-API 结构（通过逆向粉笔网页版 JS 确认）:
-  1. category-exercises (无 categoryId) → 列出全部练习，cursor 分页
-     - status=1 表示已完成，status=0 表示未完成
-  2. exercises/{id} → 练习详情
-     - 已完成练习的 userAnswers 包含用户作答
-     - sheet.chapters 包含模块信息（名称 + 题目数量）
-     - sheet.questionIds 包含所有题目 ID（顺序与 chapters 对应）
-  3. questions?ids=... → 题目元数据
-     - correctAnswer.choice 为正确答案 ("1"/"2"/"3"/"4" 对应 ABCD)
-     - difficulty 为难度值
-     - type 为题型
+API 流程:
+  1. POST /api/users/device/sid/create → 生成 DeviceSid (首次需要)
+  2. GET /combine/exercise/getExerciseBriefHistory?categoryId=1&deviceId=... → 练习历史
+  3. GET /combine/exercise/getSolution?key={exerciseKey}&deviceId=... → 用户作答
+  4. GET /combine/exercise/getReport?key={exerciseKey}&deviceId=... → 报告(模块树)
+  5. GET {staticUrl} → 静态解析(题目元数据: source, keypoints, correctAnswer)
 """
 import base64
 import time
 import logging
 import re
+import uuid
 import requests
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
 logger = logging.getLogger(__name__)
 
-# 粉笔 RSA 公钥（Base64 编码的模数）
 FENBI_PUBLIC_KEY = "ANKi9PWuvDOsagwIVvrPx77mXNV0APmjySsYjB1/GtUTY6cyKNRl2RCTt608m9nYk5VeCG2EAZRQmQNQTyfZkw0Uo+MytAkjj17BXOpY4o6+BToi7rRKfTGl6J60/XBZcGSzN1XVZ80ElSjaGE8Ocg8wbPN18tbmsy761zN5SuIl"
 FENBI_RSA_EXPONENT = 65537
 
-BASE_PARAMS = {
-    "app": "web",
-    "kav": "100",
-    "av": "100",
-    "hav": "100",
-    "version": "3.0.0.0",
-}
-
 LOGIN_URL = "https://login.fenbi.com/api/users/loginV2"
-TIKU_BASE = "https://tiku.fenbi.com/api"
+TIKU_BASE = "https://tiku.fenbi.com"
+
+COMMON_PARAMS = {
+    "app": "web",
+    "kav": "128",
+    "av": "128",
+    "hav": "128",
+    "version": "3.0.0.0",
+    "gav": "2",
+    "apcId": "0",
+}
 
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -46,12 +43,24 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
-# choice 数字到字母的映射
-CHOICE_MAP = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E", "6": "F"}
+API_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.fenbi.com/spa/tiku",
+}
+
+EXERCISE_KEY_PATTERN = re.compile(r"^\d+_\d+_[A-Za-z0-9_-]+$")
+YEAR_PATTERN = re.compile(r"(?:19|20)\d{2}")
+
+PROVINCES = [
+    "北京", "上海", "天津", "重庆",
+    "江苏", "浙江", "广东", "山东", "四川", "河南", "湖北", "湖南",
+    "安徽", "福建", "江西", "辽宁", "吉林", "黑龙江", "河北", "山西",
+    "陕西", "甘肃", "青海", "海南", "云南", "贵州", "广西", "内蒙古",
+    "新疆", "西藏", "宁夏",
+]
 
 
 def encrypt_password(password: str) -> str:
-    """RSA + PKCS#1 v1.5 加密密码"""
     modulus_bytes = base64.b64decode(FENBI_PUBLIC_KEY)
     n = int.from_bytes(modulus_bytes, byteorder="big")
     key = RSA.construct((n, FENBI_RSA_EXPONENT))
@@ -60,19 +69,157 @@ def encrypt_password(password: str) -> str:
     return base64.b64encode(encrypted).decode("utf-8")
 
 
+def _walk(obj, visitor, path=None):
+    if path is None:
+        path = []
+    if isinstance(obj, list):
+        for i, item in enumerate(obj):
+            _walk(item, visitor, path + [i])
+    elif isinstance(obj, dict):
+        visitor(obj, path)
+        for k, v in obj.items():
+            _walk(v, visitor, path + [k])
+
+
+def _first_value(obj, keys):
+    for k in keys:
+        v = obj.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _normalize_correctness(value) -> str:
+    if value is True or value == 1 or value == "1":
+        return "正确"
+    if value is False or value == -1 or value == "-1":
+        return "错误"
+    if value == 10 or value == "10":
+        return "未答"
+    return ""
+
+
+def _format_date(value) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        millis = value if value > 1e12 else value * 1000
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+        dt_bj = dt + timedelta(hours=8)
+        return dt_bj.strftime("%Y-%m-%d")
+    s = str(value)
+    m = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", s)
+    if m:
+        return m.group(0).replace(".", "-").replace("/", "-")
+    return s
+
+
+def _extract_names(value, names=None):
+    if names is None:
+        names = []
+    if isinstance(value, list):
+        for item in value:
+            _extract_names(item, names)
+    elif isinstance(value, dict):
+        if isinstance(value.get("name"), str) and value["name"].strip():
+            names.append(value["name"].strip())
+        for k in ["keyPoint", "keypoint", "keyPoints", "keypoints", "children", "path"]:
+            if k in value:
+                _extract_names(value[k], names)
+    elif isinstance(value, str) and value.strip():
+        names.append(value.strip())
+    return list(dict.fromkeys(names))
+
+
+def _module_path(obj) -> list:
+    for k in ["keyPoint", "keypoint", "keyPoints", "keypoints", "categoryPath"]:
+        if k in obj and obj[k] is not None:
+            names = _extract_names(obj[k])
+            if names:
+                return names
+    return []
+
+
+def _report_module_paths(payload) -> dict:
+    paths = {}
+
+    def build_tree(nodes, parents=None):
+        if parents is None:
+            parents = []
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                continue
+            name = node["name"].strip()
+            current = parents + [name]
+            paths[name] = current
+            if "children" in node:
+                build_tree(node["children"], current)
+
+    def visitor(obj, _):
+        if isinstance(obj.get("details"), list):
+            build_tree(obj["details"])
+
+    _walk(payload, visitor)
+    return paths
+
+
+def _collect_by_question_id(payload) -> dict:
+    result = {}
+
+    def visitor(obj, _):
+        looks_like_question = (
+            "correctAnswer" in obj
+            or "keyPoint" in obj
+            or ("prefix" in obj and any(k in obj for k in ["answer", "status", "time"]))
+        )
+        if looks_like_question and "id" in obj:
+            qid = str(obj["id"])
+        else:
+            qid = _first_value(obj, ["questionId", "question_id", "quizId", "quiz_id"])
+            qid = str(qid) if qid else None
+        if not qid:
+            return
+        existing = result.get(qid, {})
+        existing.update(obj)
+        result[qid] = existing
+
+    _walk(payload, visitor)
+    return result
+
+
+def _extract_province(source: str) -> str:
+    for prov in PROVINCES:
+        if prov in source:
+            return prov
+    if "国家" in source or "国考" in source:
+        return "全国"
+    return ""
+
+
+def _extract_source_category(source: str) -> str:
+    if "事业单位" in source or "事业编" in source:
+        return "事业编"
+    if "公务员" in source or "国考" in source or "省考" in source:
+        return "公务员"
+    if "模考" in source:
+        return "模考"
+    return ""
+
+
 class FenbiClient:
-    """粉笔 API 客户端"""
+    """粉笔 API 客户端 v2"""
 
-    SUBJECT_XINGCE = "xingce"
-    SUBJECT_SHENLUN = "shenlun"
-
-    def __init__(self, phone: str, password: str, request_interval: float = 0.3):
+    def __init__(self, phone: str, password: str, request_interval: float = 0.25):
         self.phone = phone
         self.password = password
         self.request_interval = request_interval
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self._logged_in = False
+        self._device_id = ""
 
     def _wait(self):
         if self.request_interval > 0:
@@ -93,270 +240,242 @@ class FenbiClient:
         if result.get("code") == 1:
             self._logged_in = True
             logger.info("粉笔登录成功")
+            self._ensure_device_id()
             return True
+        logger.error("粉笔登录失败: %s", result.get("msg", "未知错误"))
+        return False
+
+    def _ensure_device_id(self):
+        """生成 DeviceSid (用于 /combine/exercise/ 端点)"""
+        if self._device_id:
+            return
+
+        logger.info("正在生成 DeviceSid...")
+        fp = {
+            "canvas": "python_client_canvas",
+            "webgl": "python_client_webgl",
+            "screen": "1920x1080x24",
+            "language": "zh-CN",
+            "platform": "Win32",
+            "cores": "8",
+            "memory": "8",
+            "touchPoints": "0",
+        }
+        body = {
+            "pf": "web",
+            "startupId": str(uuid.uuid4()),
+            "extras": fp,
+        }
+        resp = self.session.post(
+            f"{TIKU_BASE}/api/users/device/sid/create",
+            json=body,
+            timeout=15,
+            headers={**API_HEADERS, "Content-Type": "application/json"},
+        )
+        data = resp.json()
+        if data.get("code") == 1:
+            self._device_id = data["data"]["deviceId"]
+            logger.info("DeviceSid 生成成功: %s", self._device_id)
         else:
-            logger.error("粉笔登录失败: %s", result.get("msg", "未知错误"))
-            return False
+            logger.warning("DeviceSid 生成失败: %s", data.get("msg", ""))
+            logger.warning("将尝试不带 deviceId 继续请求")
 
     def _ensure_login(self):
         if not self._logged_in:
             if not self.login():
                 raise RuntimeError("粉笔登录失败")
 
-    def _get(self, path: str, params: dict = None) -> dict:
-        """GET 请求"""
+    def _get_json(self, url: str, params: dict = None) -> dict:
+        """GET 请求返回 JSON"""
         self._ensure_login()
-        url = f"{TIKU_BASE}/{path}"
-        full_params = {**BASE_PARAMS, **(params or {})}
-        resp = self.session.get(url, params=full_params, timeout=15)
+        p = {**COMMON_PARAMS}
+        if self._device_id:
+            p["deviceId"] = self._device_id
+        if params:
+            p.update(params)
+
+        resp = self.session.get(url, params=p, timeout=30, headers=API_HEADERS)
         self._wait()
-        if resp.status_code == 200:
-            return resp.json()
-        logger.warning("GET %s 失败: HTTP %d", path, resp.status_code)
-        return {}
+        if resp.status_code != 200:
+            logger.warning("GET 失败: HTTP %d %s", resp.status_code, url[:80])
+            return {}
+        data = resp.json()
+        if isinstance(data.get("code"), (int, float)) and data["code"] != 1:
+            logger.warning("API 错误 code=%s: %s", data["code"], data.get("msg", ""))
+            return {}
+        return data
 
-    def get_all_exercises(self, subject: str = SUBJECT_XINGCE) -> list:
-        """
-        获取用户在指定题库下的全部已完成练习
-        使用 category-exercises 端点（无 categoryId），cursor 分页
-        只返回 status=1（已完成）的练习
-        """
-        logger.info("=== 开始采集 %s 数据 ===", subject)
+    def get_exercise_history(self, routecs: str = "xingce") -> list:
+        """获取练习历史列表 (仅 status=1 已完成)"""
+        logger.info("=== 获取练习历史 (%s) ===", routecs)
+        url = f"{TIKU_BASE}/combine/exercise/getExerciseBriefHistory"
 
-        all_completed = []
-        cursor = 0
+        all_exercises = []
+        cursor = ""
+        seen_cursors = set()
+        page = 0
 
-        while True:
-            data = self._get(f"{subject}/category-exercises", {
-                "cursor": str(cursor),
-                "count": "20",
-            })
+        while page < 500:
+            page += 1
+            params = {"routecs": routecs, "categoryId": "1"}
+            if cursor:
+                params["cursor"] = cursor
 
+            data = self._get_json(url, params)
             if not data:
                 break
 
-            datas = data.get("datas", [])
-            if not datas:
+            d = data.get("data") or {}
+            items = d.get("historyItems") or []
+            if not items:
                 break
 
-            for ex in datas:
-                if ex.get("status") == 1:
-                    all_completed.append(ex)
+            for item in items:
+                key = item.get("exerciseKey", "")
+                status = item.get("status", 0)
+                if not key or not EXERCISE_KEY_PATTERN.match(key):
+                    continue
+                if status != 1:
+                    continue
+                date = _format_date(item.get("updatedTime"))
+                all_exercises.append({
+                    "exerciseKey": key,
+                    "date": date,
+                    "status": status,
+                    "sheetName": item.get("sheetName", ""),
+                })
 
-            new_cursor = data.get("cursor", 0)
-            if new_cursor == 0 or new_cursor == cursor:
+            cursor = d.get("cursor", "")
+            if not cursor or cursor in seen_cursors:
                 break
-            cursor = new_cursor
+            seen_cursors.add(cursor)
 
-        logger.info("  %s 已完成练习 %d 套", subject, len(all_completed))
-        return all_completed
+            logger.info("  页 %d: 累计 %d 套已完成", page, len(all_exercises))
 
-    def get_exercise_detail(self, exercise_id: int, subject: str = SUBJECT_XINGCE) -> dict:
-        """获取练习详情（用户作答、模块信息、题目列表）"""
-        return self._get(f"{subject}/exercises/{exercise_id}")
+        logger.info("  共 %d 套已完成练习", len(all_exercises))
+        return all_exercises
 
-    def get_questions(self, question_ids: list, subject: str = SUBJECT_XINGCE) -> list:
-        """批量获取题目元数据（正确答案、难度等）"""
-        if not question_ids:
-            return []
+    def get_solution(self, exercise_key: str, routecs: str = "xingce") -> dict:
+        url = f"{TIKU_BASE}/combine/exercise/getSolution"
+        return self._get_json(url, {"key": exercise_key, "routecs": routecs, "format": "html"})
 
-        results = []
-        # 分批获取，每批最多 50 个
-        for i in range(0, len(question_ids), 50):
-            batch = question_ids[i:i + 50]
-            ids_str = ",".join(str(qid) for qid in batch)
-            data = self._get(f"{subject}/questions", {"ids": ids_str})
+    def get_report(self, exercise_key: str, routecs: str = "xingce") -> dict:
+        url = f"{TIKU_BASE}/combine/exercise/getReport"
+        return self._get_json(url, {"key": exercise_key, "routecs": routecs, "format": "html", "no_toast": ""})
 
-            if isinstance(data, list):
-                results.extend(data)
-            elif isinstance(data, dict) and "list" in data:
-                results.extend(data["list"])
+    def get_static_solution(self, static_url: str) -> dict:
+        """获取静态解析数据（不加 COMMON_PARAMS，避免破坏签名URL）"""
+        if not static_url:
+            return {}
+        params = {"routecs": "xingce", "type": "1"}
+        resp = self.session.get(static_url, params=params, timeout=30, headers=API_HEADERS)
+        self._wait()
+        if resp.status_code != 200:
+            logger.warning("静态解析请求失败: HTTP %d", resp.status_code)
+            return {}
+        return resp.json()
 
-        return results
+    def normalize_exercise(self, exercise_key: str, exercise_date: str,
+                           solution_payload: dict, report_payload: dict,
+                           static_payload: dict, routecs: str = "xingce") -> list:
+        """合并 solution + report + static 数据，输出标准化记录"""
+        solution_items = _collect_by_question_id(solution_payload)
+        report_items = _collect_by_question_id(report_payload)
+        static_items = _collect_by_question_id(static_payload)
+        report_paths = _report_module_paths(report_payload)
 
-    def get_all_practice_records(self, subjects: list = None) -> list:
-        """
-        获取所有题库的全部练习记录
-        返回标准化的练习记录列表（每道题一条记录）
-        """
-        if subjects is None:
-            subjects = [self.SUBJECT_XINGCE, self.SUBJECT_SHENLUN]
+        all_qids = set(solution_items.keys()) | set(report_items.keys()) | set(static_items.keys())
+
+        subject = "行测" if routecs == "xingce" else "申论" if routecs == "shenlun" else routecs
+        solution_url = f"https://spa.fenbi.com/ti/exam/solution/{exercise_key}?routecs={routecs}"
+
+        records = []
+        for qid in all_qids:
+            merged = {}
+            merged.update(solution_items.get(qid, {}))
+            merged.update(report_items.get(qid, {}))
+            merged.update(static_items.get(qid, {}))
+
+            modules = _module_path(merged)
+            if modules:
+                leaf = modules[-1]
+                if leaf in report_paths:
+                    modules = report_paths[leaf]
+
+            source = str(_first_value(merged, ["source", "questionSource"]) or "")
+            year_match = YEAR_PATTERN.search(source)
+            year = year_match.group(0) if year_match else ""
+            province = _extract_province(source)
+            source_cat = _extract_source_category(source)
+            correctness = _normalize_correctness(
+                _first_value(merged, ["correct", "isCorrect", "right", "status"])
+            )
+            duration = _first_value(merged, ["duration", "durationSeconds", "answerTime", "time"])
+            practice_date = exercise_date or _format_date(
+                _first_value(merged, ["submitTime", "createdTime", "updatedTime"])
+            )
+
+            records.append({
+                "练习ID": exercise_key,
+                "题目ID": qid,
+                "科目": subject,
+                "一级模块": modules[0] if len(modules) > 0 else "",
+                "二级模块": modules[1] if len(modules) > 1 else "",
+                "三级模块": modules[2] if len(modules) > 2 else "",
+                "题目来源": source,
+                "题目年份": year,
+                "题目省份": province,
+                "题目来源分类": source_cat,
+                "是否正确": correctness,
+                "单题用时": duration if duration is not None else "",
+                "练习日期": practice_date,
+                "题目链接": solution_url,
+            })
+
+        return records
+
+    def get_all_practice_records(self, routecs_list: list = None) -> list:
+        """获取全部练习记录"""
+        if routecs_list is None:
+            routecs_list = ["xingce"]
 
         all_records = []
 
-        for subject in subjects:
-            exercises = self.get_all_exercises(subject)
+        for routecs in routecs_list:
+            exercises = self.get_exercise_history(routecs)
 
             for i, ex in enumerate(exercises):
-                ex_id = ex.get("id")
-                ex_name = ex.get("sheet", {}).get("name", "")
-                logger.info("  (%d/%d) 获取练习详情: %s", i + 1, len(exercises), ex_name[:40])
+                key = ex["exerciseKey"]
+                logger.info("  (%d/%d) %s", i + 1, len(exercises), ex.get("sheetName", "")[:40])
 
-                detail = self.get_exercise_detail(ex_id, subject)
-                if not detail:
+                solution_data = self.get_solution(key, routecs)
+                if not solution_data:
                     continue
 
-                # 提取用户作答
-                user_answers = detail.get("userAnswers", {})
-                if not user_answers:
-                    logger.info("    无用户作答，跳过")
-                    continue
+                report_data = self.get_report(key, routecs)
 
-                # 构建模块映射（question_index -> module_name）
-                module_map = self._build_module_map(detail)
+                static_url = ""
+                su = solution_data.get("data", {}).get("staticUrl", {})
+                if isinstance(su, dict):
+                    urls = su.get("urls", [])
+                    if urls:
+                        static_url = urls[0]
 
-                # 构建题目 ID 列表
-                question_ids = detail.get("sheet", {}).get("questionIds", [])
+                static_data = self.get_static_solution(static_url) if static_url else {}
 
-                # 获取题目元数据（正确答案）
-                answered_qids = [ans.get("questionId") for ans in user_answers.values() if ans.get("questionId")]
-                questions = self.get_questions(answered_qids, subject)
-                question_map = {q.get("id"): q for q in questions if q.get("id")}
+                rows = self.normalize_exercise(
+                    exercise_key=key,
+                    exercise_date=ex["date"],
+                    solution_payload=solution_data,
+                    report_payload=report_data,
+                    static_payload=static_data,
+                    routecs=routecs,
+                )
+                all_records.extend(rows)
 
-                # 练习时间
-                practice_time = detail.get("createdTime", 0)
+                if (i + 1) % 10 == 0:
+                    logger.info("  已采集 %d 套，累计 %d 条", i + 1, len(all_records))
 
-                # 试卷信息
-                sheet = detail.get("sheet", {})
-                paper_name = sheet.get("name", "")
-                paper_id = sheet.get("paperId", "")
-
-                # 从试卷名提取年份和来源
-                year = self._extract_year(paper_name)
-                source = self._extract_source(paper_name)
-
-                # 构建题目链接
-                question_link = self._build_question_link(ex_id, subject)
-
-                # 遍历用户作答，构建记录
-                for q_index_str, ans_data in user_answers.items():
-                    qid = ans_data.get("questionId")
-                    q_index = ans_data.get("questionIndex", int(q_index_str) if q_index_str.isdigit() else 0)
-
-                    user_choice_raw = ans_data.get("answer", {}).get("choice", "")
-                    user_choice = CHOICE_MAP.get(str(user_choice_raw), str(user_choice_raw))
-
-                    question_meta = question_map.get(qid, {})
-                    correct_raw = question_meta.get("correctAnswer", {})
-                    if isinstance(correct_raw, dict):
-                        correct_choice_raw = correct_raw.get("choice", "")
-                    else:
-                        correct_choice_raw = str(correct_raw)
-                    correct_choice = CHOICE_MAP.get(str(correct_choice_raw), str(correct_choice_raw))
-
-                    is_correct = user_choice == correct_choice if user_choice and correct_choice else False
-
-                    module = module_map.get(q_index, "")
-
-                    # 根据来源判断考试类型
-                    if "事业单位" in source:
-                        exam_type = "事业单位"
-                    elif "国考" in source:
-                        exam_type = "国考"
-                    elif "省考" in source:
-                        exam_type = "省考"
-                    elif "模考" in source:
-                        exam_type = "模考"
-                    else:
-                        exam_type = "公务员"
-
-                    record = {
-                        "question_id": qid,
-                        "exercise_id": ex_id,
-                        "question_link": question_link,
-                        "practice_name": paper_name,
-                        "practice_time": practice_time,
-                        "user_answer": user_choice,
-                        "correct_answer": correct_choice,
-                        "is_correct": is_correct,
-                        "module": module,
-                        "sub_module": "",
-                        "question_type": self._map_question_type(question_meta.get("type", 0)),
-                        "year": year,
-                        "source": source,
-                        "exam_type": exam_type,
-                        "difficulty": question_meta.get("difficulty", ""),
-                        "paper_name": paper_name,
-                        "source_label": source,
-                        "subject": subject,
-                    }
-                    all_records.append(record)
-
-            logger.info("=== %s 采集完成: %d 条记录 ===", subject, len(all_records))
+            logger.info("=== %s 完成: %d 条记录 ===", routecs, len(all_records))
 
         return all_records
-
-    def _build_module_map(self, exercise_detail: dict) -> dict:
-        """
-        构建 question_index -> module_name 的映射
-        chapters 中的 questionCount 是连续的，按顺序分配
-        """
-        sheet = exercise_detail.get("sheet", {})
-        chapters = sheet.get("chapters", [])
-
-        module_map = {}
-        index = 0
-        for chapter in chapters:
-            name = chapter.get("name", "")
-            count = chapter.get("questionCount", 0)
-            for i in range(count):
-                module_map[index] = name
-                index += 1
-
-        return module_map
-
-    def _build_question_link(self, exercise_id, subject: str) -> str:
-        """构建粉笔网页版练习报告链接"""
-        if not exercise_id:
-            return ""
-        return f"https://www.fenbi.com/spa/tiku/#/{subject}/report/{exercise_id}"
-
-    def _extract_year(self, paper_name: str) -> str:
-        """从试卷名提取年份（支持'2024年'、'2025上半年'、'2023下'等格式）"""
-        # 先匹配带"年"的格式，如 "2024年国考"
-        match = re.search(r'(20\d{2})年', paper_name)
-        if match:
-            return match.group(1)
-        # 再匹配不带"年"但带上下半年标记的，如 "2025上半年"、"2023下"
-        match = re.search(r'(20\d{2})(?:上半年|下半年|上|下)', paper_name)
-        if match:
-            return match.group(1)
-        # 最后兜底：匹配 20xx 格式的4位数字
-        match = re.search(r'(20\d{2})', paper_name)
-        if match:
-            return match.group(1)
-        return ""
-
-    def _extract_source(self, paper_name: str) -> str:
-        """从试卷名提取来源分类"""
-        if "国考" in paper_name or "国家公务员" in paper_name:
-            return "国考"
-        if "事业单位" in paper_name or "事业编" in paper_name:
-            return "事业单位"
-        if "模考" in paper_name:
-            return "模考"
-        if "省考" in paper_name or "省公务员" in paper_name or "省公考" in paper_name:
-            # 提取省份名
-            for prov in ["江苏", "浙江", "广东", "山东", "北京", "上海", "四川",
-                         "河南", "湖北", "湖南", "安徽", "福建", "江西", "辽宁",
-                         "吉林", "黑龙江", "河北", "山西", "陕西", "甘肃",
-                         "青海", "海南", "云南", "贵州", "广西", "内蒙古",
-                         "新疆", "西藏", "宁夏", "重庆", "天津"]:
-                if prov in paper_name:
-                    return f"{prov}省考"
-            return "省考"
-        return ""
-
-    def _map_question_type(self, type_code: int) -> str:
-        """映射题目类型代码到中文名称"""
-        type_map = {
-            1: "单选题",
-            2: "多选题",
-            3: "判断题",
-            4: "填空题",
-            5: "简答题",
-            6: "论述题",
-            7: "公文写作",
-            8: "材料作文",
-        }
-        return type_map.get(type_code, f"题型{type_code}")
