@@ -1,0 +1,8 @@
+config.ini
+venv/
+__pycache__/
+*.pyc
+*.log
+.env
+*.xlsx
+data/sync_state.json
