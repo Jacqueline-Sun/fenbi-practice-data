@@ -317,7 +317,7 @@ class FenbiClient:
 
         while page < 500:
             page += 1
-            params = {"routecs": routecs, "categoryId": "1"}
+            params = {"routecs": routecs, "categoryId": "4"}
             if cursor:
                 params["cursor"] = cursor
 
