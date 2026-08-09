@@ -18,6 +18,8 @@ import requests
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
+from module_mapping import resolve_module, build_question_link
+
 logger = logging.getLogger(__name__)
 
 FENBI_PUBLIC_KEY = "ANKi9PWuvDOsagwIVvrPx77mXNV0APmjySsYjB1/GtUTY6cyKNRl2RCTt608m9nYk5VeCG2EAZRQmQNQTyfZkw0Uo+MytAkjj17BXOpY4o6+BToi7rRKfTGl6J60/XBZcGSzN1XVZ80ElSjaGE8Ocg8wbPN18tbmsy761zN5SuIl"
@@ -375,10 +377,46 @@ class FenbiClient:
             return {}
         return resp.json()
 
+    def get_questions_difficulty(self, question_ids: list, routecs: str = "xingce") -> dict:
+        """
+        批量获取题目难度（用旧 API）
+        返回 {question_id: difficulty} 字典
+        """
+        if not question_ids:
+            return {}
+
+        result = {}
+        # 旧 API URL（不需要 deviceId）
+        old_url = f"{TIKU_BASE}/api/{routecs}/questions"
+        old_params = {"app": "web", "kav": "100", "av": "100", "hav": "100", "version": "3.0.0.0"}
+
+        # 分批获取，每批最多 50 个
+        for i in range(0, len(question_ids), 50):
+            batch = question_ids[i:i + 50]
+            ids_str = ",".join(str(qid) for qid in batch)
+            try:
+                resp = self.session.get(old_url, params={**old_params, "ids": ids_str}, timeout=15,
+                    headers={"Accept": "application/json, text/plain, */*", "Referer": "https://www.fenbi.com/spa/tiku"})
+                if resp.status_code == 200:
+                    qs = resp.json()
+                    if isinstance(qs, list):
+                        for q in qs:
+                            qid = str(q.get("id", ""))
+                            diff = q.get("difficulty")
+                            if qid and diff is not None:
+                                result[qid] = diff
+            except Exception as e:
+                logger.debug("获取难度失败: %s", e)
+        return result
+
     def normalize_exercise(self, exercise_key: str, exercise_date: str,
                            solution_payload: dict, report_payload: dict,
-                           static_payload: dict, routecs: str = "xingce") -> list:
+                           static_payload: dict, routecs: str = "xingce",
+                           difficulty_map: dict = None) -> list:
         """合并 solution + report + static 数据，输出标准化记录"""
+        if difficulty_map is None:
+            difficulty_map = {}
+
         solution_items = _collect_by_question_id(solution_payload)
         report_items = _collect_by_question_id(report_payload)
         static_items = _collect_by_question_id(static_payload)
@@ -387,7 +425,6 @@ class FenbiClient:
         all_qids = set(solution_items.keys()) | set(report_items.keys()) | set(static_items.keys())
 
         subject = "行测" if routecs == "xingce" else "申论" if routecs == "shenlun" else routecs
-        solution_url = f"https://spa.fenbi.com/ti/exam/solution/{exercise_key}?routecs={routecs}"
 
         records = []
         for qid in all_qids:
@@ -396,11 +433,31 @@ class FenbiClient:
             merged.update(report_items.get(qid, {}))
             merged.update(static_items.get(qid, {}))
 
-            modules = _module_path(merged)
-            if modules:
-                leaf = modules[-1]
+            # 从 keypoints 提取叶子名，再用映射表查三级层级
+            leaf_names = _module_path(merged)
+            # 优先用 report 树补全路径
+            if leaf_names:
+                leaf = leaf_names[-1]
                 if leaf in report_paths:
-                    modules = report_paths[leaf]
+                    leaf_names = report_paths[leaf]
+
+            # 用映射表查标准三级模块
+            # 优先从叶子节点的最细粒度查
+            l1, l2, l3 = "", "", ""
+            if leaf_names:
+                # 尝试每一级（从最细到最粗）
+                for name in reversed(leaf_names):
+                    if not name:
+                        continue
+                    m1, m2, m3 = resolve_module(name)
+                    if m1 != "未知":
+                        l1, l2, l3 = m1, m2, m3
+                        break
+                # 如果映射表都没找到，保留原始名称
+                if not l1 and leaf_names:
+                    l1 = leaf_names[0] if len(leaf_names) > 0 else ""
+                    l2 = leaf_names[1] if len(leaf_names) > 1 else ""
+                    l3 = leaf_names[2] if len(leaf_names) > 2 else ""
 
             source = str(_first_value(merged, ["source", "questionSource"]) or "")
             year_match = YEAR_PATTERN.search(source)
@@ -414,14 +471,15 @@ class FenbiClient:
             practice_date = exercise_date or _format_date(
                 _first_value(merged, ["submitTime", "createdTime", "updatedTime"])
             )
+            difficulty = difficulty_map.get(qid, "")
 
             records.append({
                 "练习ID": exercise_key,
                 "题目ID": qid,
                 "科目": subject,
-                "一级模块": modules[0] if len(modules) > 0 else "",
-                "二级模块": modules[1] if len(modules) > 1 else "",
-                "三级模块": modules[2] if len(modules) > 2 else "",
+                "一级模块": l1,
+                "二级模块": l2,
+                "三级模块": l3,
                 "题目来源": source,
                 "题目年份": year,
                 "题目省份": province,
@@ -429,7 +487,8 @@ class FenbiClient:
                 "是否正确": correctness,
                 "单题用时": duration if duration is not None else "",
                 "练习日期": practice_date,
-                "题目链接": solution_url,
+                "题目难度": difficulty,
+                "题目链接": build_question_link(exercise_key, qid, routecs),
             })
 
         return records
@@ -463,6 +522,11 @@ class FenbiClient:
 
                 static_data = self.get_static_solution(static_url) if static_url else {}
 
+                # 从 solution_items 提取所有题目 ID（key 就是 question id 字符串）
+                qids = list(_collect_by_question_id(solution_data).keys())
+                # 批量获取每题难度
+                difficulty_map = self.get_questions_difficulty(qids, routecs)
+
                 rows = self.normalize_exercise(
                     exercise_key=key,
                     exercise_date=ex["date"],
@@ -470,6 +534,7 @@ class FenbiClient:
                     report_payload=report_data,
                     static_payload=static_data,
                     routecs=routecs,
+                    difficulty_map=difficulty_map,
                 )
                 all_records.extend(rows)
 
